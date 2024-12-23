@@ -1,10 +1,50 @@
 import os
 import re
 from typing import Dict, List, Any
-from code_ast import ast
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 from global_regex import JS_PATTERNS, PY_PATTERNS
+from ast_extractor import JavaScriptASTExtractor
+import json
+import pathlib
+
+# JavaScript built-in functions and keywords
+BUILT_INS = {
+    # Core objects
+    'console', 'Math', 'JSON', 'Object', 'Array', 'String', 'Number', 
+    'Boolean', 'Date', 'RegExp', 'Error', 'Promise', 'setTimeout', 
+    'setInterval', 'require', 'Buffer',
+    
+    # Promise methods
+    'then', 'catch', 'finally', 'resolve', 'reject',
+    
+    # Array methods
+    'map', 'filter', 'reduce', 'forEach', 'some', 'every', 'find', 'includes',
+    'push', 'pop', 'shift', 'unshift', 'slice', 'splice', 'join',
+    
+    # String methods
+    'toString', 'split', 'replace', 'trim', 'substring', 'substr',
+    
+    # Number methods
+    'toFixed', 'toPrecision', 'toExponential',
+    
+    # Global functions
+    'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'isArray',
+    
+    # Common callbacks
+    'callback',
+    
+    # Object methods
+    'hasOwnProperty', 'assign', 'keys', 'values',
+    
+    # Console methods
+    'log', 'error', 'warn', 'info',
+    
+    # Moment.js methods
+    'format', 'endOf', 'isBefore', 'isSame', 
+    'isSameOrBefore', 'isValid', 'startOf'
+}
+KEYWORDS = {'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break', 'continue', 'return', 'try', 'catch', 'finally', 'throw', 'class', 'extends', 'new', 'this', 'super', 'import', 'export', 'default', 'null', 'undefined', 'true', 'false'}
 
 class FileNodeCreator:
     def __init__(self, language: str = 'javascript'):
@@ -22,174 +62,475 @@ class FileNodeCreator:
         self.neo4j_user = os.getenv('NEO4J_USER')
         self.neo4j_password = os.getenv('NEO4J_PASSWORD')
         self.driver = GraphDatabase.driver(self.neo4j_uri, auth=(self.neo4j_user, self.neo4j_password))
+    
+    def resolve_relative_path(self,file_path,relative_path):
+        current_path = pathlib.Path(file_path).parent
+        resolved_path = (current_path / relative_path).resolve()
+        resolved_path = str(str(resolved_path).replace('.js', ''))
+        return str(resolved_path).replace('\\', '/')
 
-    def _extract_imports(self, file_content: str) -> Dict[str, List[str]]:
-        """Extract import information from file content.
+    def _extract_imports(self,ast,file_path) -> dict:
+        raw_imports = []
+        imported_paths = []
+        undefined_imports = []
+        imported_variables = []  # Will now store [variable_name, path]
+        imported_functions = []  # Will now store [function_name, path]
         
-        Args:
-            file_content (str): Content of the file
-            
-        Returns:
-            Dict containing raw_imports, imported_paths, and undefined_imports
-        """
-        import_info = {
-            'raw_imports': [],
-            'imported_paths': [],
-            'undefined_imports': []
-        }
-        
-        # Get all import patterns for the current language
-        import_patterns = self.patterns['imports']
-        
-        for pattern_name, pattern in import_patterns.items():
-            matches = re.finditer(pattern, file_content)
-            for match in matches:
-                # Get the full import statement
-                full_line = match.group(0)
-                import_info['raw_imports'].append(full_line.strip())
-                
-                # Get the path/module name
-                path = match.group(1)
-                if '/' in path:
-                    import_info['imported_paths'].append(path)
-                else:
-                    import_info['undefined_imports'].append(path)
+        try:
+            def process_node(node):
+                if not isinstance(node, dict):
+                    return
                     
-        return import_info
+                node_type = node.get('type')
+                text = node.get('text', '')
+                
+                # Regular imports
+                if node_type == 'import_statement':
+                    raw_imports.append(text)
+                    
+                    # Get the source path
+                    current_path = None
+                    for child in node.get('children', []):
+                        if child.get('type') == 'string':
+                            path = child.get('text', '').strip("'").strip('"')
+                            if path.startswith('.'):
+                                current_path = self.resolve_relative_path(file_path,path)
+                                imported_paths.append(current_path)
+                            else:
+                                current_path = path
+                                undefined_imports.append(path)
+                    
+                    # Process import clause
+                    for child in node.get('children', []):
+                        if child.get('type') == 'import_clause':
+                            # Default import
+                            for clause_child in child.get('children', []):
+                                if clause_child.get('type') == 'identifier':
+                                    imported_variables.append([clause_child.get('text'), current_path])
+                                elif clause_child.get('type') == 'named_imports':
+                                    # Handle named imports
+                                    for spec in clause_child.get('children', []):
+                                        if spec.get('type') == 'import_specifier':
+                                            spec_text = spec.get('text', '')
+                                            if ' as ' in spec_text:
+                                                imported_functions.append([spec_text.split(' as ')[1].strip(), current_path])
+                                            else:
+                                                imported_functions.append([spec_text, current_path])
+                                elif clause_child.get('type') == 'namespace_import':
+                                    # Handle namespace import
+                                    namespace_text = clause_child.get('text')
+                                    if ' as ' in namespace_text:
+                                        imported_variables.append([namespace_text.split(' as ')[1].strip(), current_path])
+                
+                # Dynamic imports
+                elif node_type in ['await_expression', 'expression_statement']:
+                    if 'import(' in text:
+                        raw_imports.append(text)
+                        # Extract path from dynamic import
+                        path_match = re.search(r"import\(['\"]([^'\"]+)['\"]\)", text)
+                        if path_match:
+                            path = path_match.group(1)
+                            if path.startswith('.'):
+                                imported_paths.append(self.resolve_relative_path(file_path,path))
+                            else:
+                                undefined_imports.append(path)
+                
+                # Require statements
+                elif node_type == 'lexical_declaration' and re.match(r'.*const\s+(?:\w+|\{[^}]+\})\s*=\s*require\([\'"].*[\'"]\).*', text):
+                    raw_imports.append(text)
+                    
+                    # Get the require path
+                    current_path = None
+                    path_match = re.search(r"require\(['\"]([^'\"]+)['\"]\)", text)
+                    if path_match:
+                        path = path_match.group(1)
+                        if path.startswith('.'):
+                            current_path = self.resolve_relative_path(file_path,path)
+                            imported_paths.append(current_path)
+                        else:
+                            current_path = path
+                            undefined_imports.append(path)
+                    
+                    # Handle destructured require
+                    if '{' in text:
+                        for child in node.get('children', []):
+                            if child.get('type') == 'variable_declarator':
+                                for var_child in child.get('children', []):
+                                    if var_child.get('type') == 'object_pattern':
+                                        for prop in var_child.get('children', []):
+                                            if prop.get('type') == 'shorthand_property_identifier_pattern':
+                                                imported_functions.append([prop.get('text'), current_path])
+                    else:
+                        # Regular require
+                        var_match = re.search(r"const\s+(\w+)\s*=\s*require", text)
+                        if var_match:
+                            imported_variables.append([var_match.group(1), current_path])
 
-    def _extract_functions_and_classes(self, ast_data: Any) -> Dict[str, List[str]]:
-        """Extract function and class information from AST."""
-        print("\n=== Starting function extraction ===")
-        print(f"Initial AST data type: {type(ast_data)}")   
+                # Process children
+                for child in node.get('children', []):
+                    process_node(child)
+
+            if ast and isinstance(ast, dict):
+                process_node(ast)
+
+            # Remove duplicates and sort
+            return {
+                'raw_imports': sorted(set(raw_imports)),
+                'imported_paths': sorted(set(imported_paths)),
+                'undefined_imports': sorted(set(undefined_imports)),
+                'imported_variables': sorted(imported_variables, key=lambda x: x[0]),  # Sort by variable name
+                'imported_functions': sorted(imported_functions, key=lambda x: x[0])   # Sort by function name
+            }
+            
+        except Exception as e:
+            print(f"Error processing imports: {e}")
+            return {
+                'raw_imports': [],
+                'imported_paths': [],
+                'undefined_imports': [],
+                'imported_variables': [],
+                'imported_functions': []
+            }
+
+    def _extract_functions_and_classes(self, ast) -> Dict[str, Any]:
+        """Extract function and class information using AST."""
         info = {
             'names_of_functions_defined': [],
             'names_of_classes_defined': [],
             'methods_of_classes': [],
-            'name_of_function_called_related_to_imports': [],
-            'orphan_function': [],
-            'arrow_functions': [],
-            'object_methods': []
+            'function_definitions': [],
+            'class_definitions': []
         }
         
-        def visit_node(node, current_class=None):
-            if not hasattr(node, 'type'):
-                return
+        try:
+            def get_node_lines(node):
+                start = node.get('start_point', [0, 0])[0] + 1
+                end = node.get('end_point', [0, 0])[0] + 1
+                return start, end
+
+            def add_function_definition(name, code, node):
+                start, end = get_node_lines(node)
+                info['function_definitions'].append({
+                    'function_name': name,
+                    'function_code': code,
+                    'start_line': start,
+                    'end_line': end
+                })
             
-            node_type = node.get('type', '')
-            print(f"\nVisiting node of type: {node_type}")
-            
-            # Handle function declarations
-            if node_type == 'function_declaration':
-                func_name = node.get('id', {}).get('name')
-                print(f"Found function declaration: {func_name}")
-                if func_name and not current_class:
-                    info['names_of_functions_defined'].append(func_name)
+            def process_node(node):
+                if not isinstance(node, dict):
+                    return
                     
-            # Handle class declarations
-            elif node_type == 'class_declaration':
-                class_name = node.get('id', {}).get('name')
-                print(f"Found class declaration: {class_name}")
-                if class_name:
-                    info['names_of_classes_defined'].append(class_name)
-                    info['methods_of_classes'].append({
-                        'class_name': class_name,
-                        'methods': []
-                    })
-                    # Visit class body with current_class context
-                    class_body = node.get('body', {}).get('body', [])
-                    for method_node in class_body:
-                        visit_node(method_node, class_name)
-                    
-            # Handle method definitions
-            elif node_type == 'method_definition':
-                method_name = node.get('key', {}).get('name')
-                print(f"Found method definition: {method_name}")
-                if method_name and current_class:
-                    class_methods = next(
-                        (item for item in info['methods_of_classes'] if item['class_name'] == current_class),
-                        None
-                    )
-                    if class_methods:
-                        class_methods['methods'].append(method_name)
-                    
-            # Handle variable declarations with functions
-            elif node_type == 'variable_declarator':
-                var_name = node.get('id', {}).get('name')
-                init = node.get('init', {})
-                print(f"Found variable declaration: {var_name}")
-                if init.get('type') in ['arrow_function', 'function_expression']:
-                    info['names_of_functions_defined'].append(var_name)
-                    if init.get('type') == 'arrow_function':
-                        info['arrow_functions'].append(var_name)
-                    
-            # Handle object methods and pairs
-            elif node_type == 'pair':
-                key = node.get('key', {})
-                value = node.get('value', {})
-                method_name = key.get('name') or key.get('value')
-                print(f"Found pair node with method name: {method_name}")
+                node_type = node.get('type')
+                text = node.get('text', '')
                 
-                if method_name:
-                    if value.get('type') in ['function_expression', 'arrow_function']:
-                        info['object_methods'].append(method_name)
-                        info['names_of_functions_defined'].append(method_name)
+                # Object method definitions using regex
+                if node_type == 'pair':
+                    # Match patterns like: functionName: function(...) or functionName: (...) =>
+                    method_match = re.match(r'^\s*(\w+)\s*:\s*(?:(?:async\s+)?function\s*\(.*\)|(?:\([^)]*\)|[^=]+)\s*=>)', text)
+                    if method_match:
+                        method_name = method_match.group(1)
+                        if method_name and method_name not in info['names_of_functions_defined']:
+                            info['names_of_functions_defined'].append(method_name)
+                            add_function_definition(method_name, text, node)
+                
+                elif node_type == 'method_definition':
+                    for child in node.get('children', []):
+                        if child.get('type') == 'property_identifier':
+                            method_name = child.get('text')
+                            if method_name:
+                                info['names_of_functions_defined'].append(method_name)
+                                add_function_definition(method_name, text, node)
+                
+                # Function declarations (including generator functions)
+                elif node_type == 'function_declaration':
+                    for child in node.get('children', []):
+                        if child.get('type') == 'identifier':
+                            func_name = child.get('text')
+                            if func_name and func_name not in info['names_of_functions_defined']:
+                                info['names_of_functions_defined'].append(func_name)
+                                add_function_definition(func_name, text, node)
+                
+                # Generator functions
+                elif node_type == 'generator_function_declaration':
+                    for child in node.get('children', []):
+                        if child.get('type') == 'identifier':
+                            func_name = child.get('text')
+                            if func_name and func_name not in info['names_of_functions_defined']:
+                                info['names_of_functions_defined'].append(func_name)
+                                add_function_definition(func_name, text, node)
+                
+                # Arrow functions and variable declarations
+                elif node_type == 'lexical_declaration':
+                    print(text, "text", "lexical_declaration type")
+                    # Modified regex to catch both function and arrow function declarations, but not callbacks
+                    func_match = re.search(r'(?:const|let|var)\s+(\w+)\s*=\s*(?:(?:async\s+)?function\s*\(|\([^)]*\)\s*=>|[^=]*=>\s*\{)', text)
+                    print(func_match, "func_match", "lexical_declaration type")
+                    if func_match:
+                        func_name = func_match.group(1)
+                        if func_name and func_name not in info['names_of_functions_defined']:
+                            info['names_of_functions_defined'].append(func_name)
+                            add_function_definition(func_name, text, node)
                     
-            # Handle property assignments
-            elif node_type == 'property':
-                key = node.get('key', {})
-                value = node.get('value', {})
-                prop_name = key.get('name')
-                print(f"Found property assignment: {prop_name}")
-                if prop_name and value.get('type') in ['function_expression', 'arrow_function']:
-                    info['object_methods'].append(prop_name)
-                    info['names_of_functions_defined'].append(prop_name)
+                    # Keep the existing AST traversal as backup
+                    for child in node.get('children', []):
+                        if child.get('type') == 'variable_declarator':
+                            func_name = None
+                            for var_child in child.get('children', []):
+                                if var_child.get('type') == 'identifier':
+                                    func_name = var_child.get('text')
+                                elif var_child.get('type') in ['arrow_function', 'function']:
+                                    if func_name and func_name not in info['names_of_functions_defined']:
+                                        info['names_of_functions_defined'].append(func_name)
+                                        add_function_definition(func_name, text, node)
+                
+                # Classes and their methods
+                elif node_type == 'class_declaration':
+                    class_info = {
+                        'class_name': '',
+                        'class_code': text,
+                        'class_start_point': get_node_lines(node)[0],
+                        'class_end_point': get_node_lines(node)[1],
+                        'methods': []
+                    }
                     
-            # Handle assignment expressions
-            elif node_type == 'assignment_expression':
-                left = node.get('left', {})
-                right = node.get('right', {})
-                assign_name = left.get('name')
-                print(f"Found assignment expression: {assign_name}")
-                if assign_name and right.get('type') in ['function_expression', 'arrow_function']:
-                    info['names_of_functions_defined'].append(assign_name)
+                    # Get class name
+                    for child in node.get('children', []):
+                        if child.get('type') == 'identifier':
+                            class_info['class_name'] = child.get('text')
+                            if class_info['class_name'] not in info['names_of_classes_defined']:
+                                info['names_of_classes_defined'].append(class_info['class_name'])
                     
-            # Handle function calls
-            elif node_type == 'call_expression':
-                callee = node.get('callee', {})
-                if callee.get('type') == 'identifier':
-                    func_name = callee.get('name')
-                    print(f"Found call expression: {func_name}")
-                    if func_name:
-                        if func_name.startswith('_'):
-                            info['orphan_function'].append(func_name)
-                        elif func_name not in info['names_of_functions_defined']:
-                            info['name_of_function_called_related_to_imports'].append(func_name)
-                            
-            # Recursively visit children
-            for key, value in node.items():
-                if isinstance(value, dict):
-                    visit_node(value, current_class)
-                elif isinstance(value, list):
-                    for item in value:
-                        if isinstance(item, dict):
-                            visit_node(item, current_class)
+                    # Get methods
+                    for child in node.get('children', []):
+                        if child.get('type') == 'class_body':
+                            for method in child.get('children', []):
+                                if method.get('type') == 'method_definition':
+                                    method_name = ''
+                                    for method_child in method.get('children', []):
+                                        if method_child.get('type') == 'property_identifier':
+                                            method_name = method_child.get('text')
+                                            
+                                    if method_name:
+                                        class_info['methods'].append({
+                                            'method_name': method_name,
+                                            'method_code': method.get('text', ''),
+                                            'method_start_point': get_node_lines(method)[0],
+                                            'method_end_point': get_node_lines(method)[1]
+                                        })
+                
+                    info['class_definitions'].append(class_info)
+                
+                # Process children recursively
+                for child in node.get('children', []):
+                    process_node(child)
+            
+            if ast and isinstance(ast, dict):
+                process_node(ast)
+            
+            # Sort all lists for consistency
+            for key in info:
+                if isinstance(info[key], list):
+                    if key == 'methods_of_classes':
+                        for class_info in info['methods_of_classes']:
+                            class_info['methods'].sort()
+                    elif key == 'function_definitions':
+                        info[key].sort(key=lambda x: x['function_name'])
+                    elif key == 'class_definitions':
+                        info[key].sort(key=lambda x: x['class_name'])
+                    else:
+                        info[key].sort()
+            
+            return info
+            
+        except Exception as e:
+            print(f"Error processing functions and classes: {e}")
+            return {
+                'names_of_functions_defined': [],
+                'names_of_classes_defined': [],
+                'methods_of_classes': [],
+                'function_definitions': [],
+                'class_definitions': []
+            }
+
+    def _extract_exports(self, ast, defined_functions, defined_classes) -> Dict[str, list]:
+        exports = {
+            'exported_functions': [],
+            'exported_variables': [],
+            'exported_class': []
+        }
         
-        # Start the traversal
-        print("Starting traversal from root node 1")
-        print(f"AST data type: {type(ast_data)}")
-        if hasattr(ast_data, 'source_tree'):
-            print("Found source_tree, processing...")
-            tree = ast_data.source_tree
-            if hasattr(tree, 'root_node'):
-                print(f"Found root_node, type: {type(tree.root_node)}")
-                visit_node(tree.root_node)
+        try:
+            def process_node(node):
+                if not isinstance(node, dict):
+                    return
+                    
+                node_type = node.get('type')
+                text = node.get('text', '')
+                
+                # ES6 exports
+                if node_type == 'export_statement':
+                    # Direct exports: export class/function/const
+                    export_match = re.search(r'export\s+(class|function|const)\s+(\w+)', text)
+                    if export_match:
+                        export_type, name = export_match.groups()
+                        if export_type == 'class':
+                            exports['exported_class'].append(name)
+                        elif export_type == 'function':
+                            exports['exported_functions'].append(name)
+                        elif export_type == 'const':
+                            if name in defined_functions:
+                                exports['exported_functions'].append(name)
+                            else:
+                                exports['exported_variables'].append(name)
+                
+                    # Named exports: export { name1, name2 }
+                    export_list = re.findall(r'export\s*{\s*([\w\s,]+)\s*}', text)
+                    if export_list:
+                        names = re.findall(r'\w+', export_list[0])
+                        for name in names:
+                            if name in defined_functions:
+                                exports['exported_functions'].append(name)
+                            elif name in defined_classes:
+                                exports['exported_class'].append(name)
+                            else:
+                                exports['exported_variables'].append(name)
+                
+                # CommonJS exports
+                elif node_type == 'expression_statement':
+                    # Direct module.exports = variable_name
+                    direct_export = re.search(r'module\.exports\s*=\s*(\w+)(?:\s*;)?', text)
+                    if direct_export:
+                        name = direct_export.group(1)
+                        if name in defined_functions:
+                            exports['exported_functions'].append(name)
+                        elif name in defined_classes:
+                            exports['exported_class'].append(name)
+                        else:
+                            exports['exported_variables'].append(name)
+                    
+                    # For any text containing module.exports
+                    if 'module.exports' in text:
+                        # Check for all defined functions in the text
+                        for func in defined_functions:
+                            # Look for any occurrence of the function name that looks like an export
+                            # This could be: func: function(){}, func(){}, func: func, etc.
+                            if any(pattern.format(func) in text for pattern in [
+                                '{}:', # object key
+                                '{},', # last item in object
+                                '{}()', # method shorthand
+                            ]):
+                                exports['exported_functions'].append(func)
+                    
+                    # Named exports: module.exports.name = ...
+                    named_match = re.search(r'module\.exports\.(\w+)\s*=\s*(class|function)?', text)
+                    if named_match:
+                        name, export_type = named_match.groups()
+                        if export_type == 'class' or name in defined_classes:
+                            exports['exported_class'].append(name)
+                        elif export_type == 'function' or name in defined_functions:
+                            exports['exported_functions'].append(name)
+                        else:
+                            exports['exported_variables'].append(name)
+                
+                # Process children recursively
+                for child in node.get('children', []):
+                    process_node(child)
+            
+            if ast and isinstance(ast, dict):
+                process_node(ast)
+            
+            # Remove duplicates and sort
+            for key in exports:
+                exports[key] = sorted(set(exports[key]))
+            
+            return exports
+            
+        except Exception as e:
+            print(f"Error processing exports: {e}")
+            return {
+                'exported_functions': [],
+                'exported_variables': [],
+                'exported_class': []
+            }
+
+    def _extract_function_calls_with_path(self, ast, imported_variables, imported_functions) -> List[Dict[str, str]]:
+        function_calls = []
+        seen_calls = set()  # Add this to track seen calls
+        text = ast.get('text', '')
         
-        # Remove duplicates while preserving order
-        for key in info:
-            if isinstance(info[key], list):
-                info[key] = list(dict.fromkeys(info[key]))
-        
-        return info
+        try:
+            # First find all instances where imported classes are instantiated
+            variable_mappings = {}  # Will store 'service' -> 'DefaultService' mappings
+            
+            # Create pattern using imported variable names
+            imported_class_names = '|'.join([var[0] for var in imported_variables])
+            if imported_class_names:
+                instance_pattern = rf'const\s+(\w+)\s*=\s*new\s+({imported_class_names})'
+                
+                # Find all instances
+                for match in re.finditer(instance_pattern, text):
+                    var_name = match.group(1)    # e.g., 'service'
+                    class_name = match.group(2)  # e.g., 'DefaultService'
+                    variable_mappings[var_name] = class_name
+
+            # Now create patterns for function calls using both original imports and instantiated variables
+            all_var_names = set()
+            
+            # Add original imported variables
+            all_var_names.update(var[0] for var in imported_variables)
+            
+            # Add instantiated variable names
+            all_var_names.update(variable_mappings.keys())
+            
+            # Create patterns
+            imported_vars = '|'.join(all_var_names)
+            imported_funcs = '|'.join([func[0] for func in imported_functions])
+            
+            # When adding a function call, check if we've seen it:
+            def add_function_call(func_call, path):
+                call_key = f"{func_call}:{path}"
+                if call_key not in seen_calls:
+                    function_calls.append({
+                        'function_call': func_call,
+                        'path': path
+                    })
+                    seen_calls.add(call_key)
+
+            # Find direct function calls
+            if imported_funcs:
+                direct_pattern = rf'({imported_funcs})\('
+                for match in re.finditer(direct_pattern, text):
+                    func_name = match.group(1)
+                    for name, path in imported_functions:
+                        if name == func_name:
+                            add_function_call(func_name, path)
+            
+            # Find method calls on both imported and instantiated variables
+            if imported_vars:
+                method_pattern = rf'({imported_vars})\.(\w+)\('
+                for match in re.finditer(method_pattern, text):
+                    var_name = match.group(1)
+                    method_name = match.group(2)
+                    
+                    # If it's an instantiated variable, look up its class
+                    if var_name in variable_mappings:
+                        class_name = variable_mappings[var_name]
+                        # Find the path for the class
+                        for name, path in imported_variables:
+                            if name == class_name:
+                                add_function_call(f"{var_name}.{method_name}", path)
+                    else:
+                        # Direct imported variable
+                        for name, path in imported_variables:
+                            if name == var_name:
+                                add_function_call(f"{var_name}.{method_name}", path)
+            
+            return function_calls
+            
+        except Exception as e:
+            print(f"Error processing function calls: {e}")
+            return []
 
     def create_file_node(self, file_path: str) -> Dict[str, Any]:
         """Create a node representation for a file with all required metadata.
@@ -202,22 +543,51 @@ class FileNodeCreator:
         """
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
-            
-        # Generate AST
-        ast_data = ast(content,self.language)
         
+        extractor = JavaScriptASTExtractor("")
+        ast = extractor.process_js_file(file_path)
+        with open("ast.json", "w") as f:
+            json.dump(ast, f, indent=4)
         # Extract imports
-        import_info = self._extract_imports(content)
+        import_info = self._extract_imports(ast,file_path)
+        print(import_info, "import_info")
+        
+        # Extract function calls with path info
+        function_calls_info = self._extract_function_calls_with_path(
+            ast,
+            import_info['imported_variables'],
+            import_info['imported_functions']
+        )
+        print("--------------------------------")
+        print(function_calls_info, "function_calls_info")
+        print("--------------------------------")
         
         # Extract functions and classes
-        code_info = self._extract_functions_and_classes(ast_data)
+        code_info = self._extract_functions_and_classes(ast)
+        print("--------------------------------")
+        print(code_info, "code_info")
+        print("--------------------------------")
+
+        # Extract exports
+        exports_info = self._extract_exports(ast,code_info['names_of_functions_defined'],code_info['names_of_classes_defined'])
+        print("--------------------------------")
+        print(exports_info, "exports_info")
+        print("--------------------------------")
+
+        barrel_directories = self._identify_barrels(import_info['imported_paths'])
+        print("--------------------------------")
+        print(barrel_directories, "barrel_directories")
+        print("--------------------------------")
         
         # Combine all metadata
         node_data = {
             'language': self.language,
             'code': content,
             **import_info,
-            **code_info
+            **code_info,
+            **exports_info,
+            'barrel_directories': barrel_directories,
+            'function_calls': function_calls_info
         }
         
         return node_data
@@ -230,6 +600,14 @@ class FileNodeCreator:
             file_path (str): Path to the file
         """
         with self.driver.session() as session:
+            # Convert all nested structures to JSON strings
+            node_data['methods_of_classes'] = json.dumps(node_data['methods_of_classes'])
+            node_data['function_calls'] = json.dumps(node_data['function_calls'])
+            node_data['imported_variables'] = json.dumps(node_data['imported_variables'])
+            node_data['imported_functions'] = json.dumps(node_data['imported_functions'])
+            node_data['function_definitions'] = json.dumps(node_data['function_definitions'])
+            node_data['class_definitions'] = json.dumps(node_data['class_definitions'])
+            
             # Create node with all metadata
             cypher_query = """
             CREATE (f:File {
@@ -239,16 +617,21 @@ class FileNodeCreator:
                 raw_imports: $raw_imports,
                 imported_paths: $imported_paths,
                 undefined_imports: $undefined_imports,
+                imported_variables: $imported_variables,
+                imported_functions: $imported_functions,
                 names_of_functions_defined: $names_of_functions_defined,
                 names_of_classes_defined: $names_of_classes_defined,
                 methods_of_classes: $methods_of_classes,
-                name_of_function_called_related_to_imports: $name_of_function_called_related_to_imports,
-                orphan_function: $orphan_function
+                function_calls: $function_calls,
+                function_definitions: $function_definitions,
+                class_definitions: $class_definitions,
+                exported_functions: $exported_functions,
+                exported_variables: $exported_variables,
+                exported_class: $exported_class,
+                barrel_directories: $barrel_directories
             })
             """
-            session.run(cypher_query, 
-                       file_path=file_path,
-                       **node_data)
+            session.run(cypher_query, file_path=file_path, **node_data)
 
     def process_codebase(self, root_dir: str):
         """Process entire codebase and create nodes for all files.
@@ -271,3 +654,31 @@ class FileNodeCreator:
     def close(self):
         """Close the Neo4j connection."""
         self.driver.close()
+
+    def _identify_barrels(self, imported_paths: List[str]) -> List[str]:
+        """Identify directories that are being imported (which must contain barrel files).
+        
+        Args:
+            imported_paths (List[str]): List of resolved import paths
+            
+        Returns:
+            List[str]: List of directory paths that are being imported
+        """
+        barrel_directories = []
+        
+        for path in imported_paths:
+            # If the path exists and is a directory, it must contain a barrel file
+            if os.path.isdir(path):
+                barrel_directories.append(path.replace('\\', '/'))
+        
+        return sorted(set(barrel_directories))
+
+if __name__ == "__main__":
+    # Initialize FileNodeCreator
+    creator = FileNodeCreator(language='javascript')
+    
+    # Specify the test file
+    test_file = "./test/js-test-project/create.js"
+    print(f"\nProcessing file: {test_file}")
+    
+    creator.create_file_node(test_file)
