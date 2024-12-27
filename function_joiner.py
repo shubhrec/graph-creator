@@ -239,13 +239,13 @@ class FunctionCallAnalyzer:
             if target_info["type"] == "function":
                 target_match = """
                 MATCH (target:Function {name: $target_name})
-                WHERE target.file_path = $target_path + '.js'
+                WHERE target.file_path = $target_path
                 """
             else:
                 target_match = """
                 MATCH (targetClass:Class {name: $target_class_name})
                 -[:CONTAINS_METHOD]->(target:Method {name: $target_name})
-                WHERE targetClass.file_path = $target_path + '.js'
+                WHERE targetClass.file_path = $target_path
                 """
 
             cypher = f"""
@@ -302,7 +302,7 @@ class FunctionCallAnalyzer:
                     "type": call["type"],
                     "name": call["function_call"],
                     "class_name": call.get("class_name"),
-                    "target_path": call["path"].replace('.js', '')
+                    "target_path": call["path"]
                 }
                 self._create_call_relationship(source_info, target_info)
             else:
@@ -345,7 +345,7 @@ class FunctionCallAnalyzer:
                 target_info = {
                     "type": call["type"],
                     "name": call["function_call"],
-                    "target_path": call["path"].replace('.js', '')  # Remove .js extension
+                    "target_path": call["path"]  
                 }
                 # print(f"Debug - target_info after path fix: {target_info}")
                 # print('--------------------------------')
@@ -369,7 +369,7 @@ class FunctionCallAnalyzer:
                     self._create_call_relationship(source_info, target_info)
 
     def _get_target_file_node(self, path):
-        """Get file node by path, handling cases with/without .js extension"""
+        """get target node with file path"""
         with self.driver.session() as session:
             # Try exact path first
             result = session.run(
@@ -377,15 +377,7 @@ class FunctionCallAnalyzer:
                 path=path
             )
             record = result.single()
-            
-            if not record:
-                # Try with .js extension
-                result = session.run(
-                    "MATCH (f:File {path: $path + '.js'}) RETURN f",
-                    path=path
-                )
-                record = result.single()
-                
+
             return record["f"] if record else None
 
 def test_analyzer(neo4j_uri, neo4j_user, neo4j_password, openai_api_key):
