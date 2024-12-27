@@ -35,19 +35,17 @@ class FileJoiner:
                 imported_paths = record['imported_paths']
                 
                 for import_path in imported_paths:
-                    # Normalize the import path
-                    normalized_path = self.normalize_path(import_path)
                     
                     # Find and create relationship
                     relationship_query = """
                     MATCH (source:File {path: $source_path})
                     MATCH (target:File)
-                    WHERE target.path = $normalized_path OR target.path = $normalized_path + '.js'
+                    WHERE target.path contains $normalized_path
                     MERGE (source)-[r:IMPORTS]->(target)
                     """
                     session.run(relationship_query, 
                               source_path=source_path,
-                              normalized_path=normalized_path)
+                              normalized_path=import_path)
 
     def verify_relationships(self):
         """Print all created relationships"""

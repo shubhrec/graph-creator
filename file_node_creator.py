@@ -47,7 +47,7 @@ BUILT_INS = {
 KEYWORDS = {'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break', 'continue', 'return', 'try', 'catch', 'finally', 'throw', 'class', 'extends', 'new', 'this', 'super', 'import', 'export', 'default', 'null', 'undefined', 'true', 'false'}
 
 class FileNodeCreator:
-    def __init__(self, language: str = 'javascript'):
+    def __init__(self, language: str = 'javascript',remove: str = '/app/test/'):
         """Initialize the FileNodeCreator with specified language.
         
         Args:
@@ -55,7 +55,8 @@ class FileNodeCreator:
         """
         self.language = language.lower()
         self.patterns = JS_PATTERNS if self.language == 'javascript' else PY_PATTERNS
-        
+        self.remove = remove
+
         # Load Neo4j credentials from .env
         load_dotenv()
         self.neo4j_uri = os.getenv('NEO4J_URI')
@@ -65,8 +66,14 @@ class FileNodeCreator:
     
     def resolve_relative_path(self,file_path,relative_path):
         current_path = pathlib.Path(file_path).parent
-        resolved_path = (current_path / relative_path).resolve()
-        resolved_path = str(str(resolved_path).replace('.js', ''))
+        resolved_path = str((current_path / relative_path).resolve())
+        print(resolved_path, "resolved_path")
+        if os.path.isfile(resolved_path+'.js'):
+            print("Entered this")
+            if not resolved_path.endswith('.js'):
+                resolved_path = resolved_path + '.js'
+        if(str(resolved_path).startswith(self.remove)):
+            return str(resolved_path).replace(self.remove, '')
         return str(resolved_path).replace('\\', '/')
 
     def _extract_imports(self,ast,file_path) -> dict:
@@ -243,6 +250,7 @@ class FileNodeCreator:
                                 add_function_definition(method_name, text, node)
                 
                 # Function declarations (including generator functions)
+
                 elif node_type == 'function_declaration':
                     for child in node.get('children', []):
                         if child.get('type') == 'identifier':
@@ -320,7 +328,6 @@ class FileNodeCreator:
                                         })
                 
                     info['class_definitions'].append(class_info)
-                
                 # Process children recursively
                 for child in node.get('children', []):
                     process_node(child)
@@ -462,9 +469,11 @@ class FileNodeCreator:
         try:
             # First find all instances where imported classes are instantiated
             variable_mappings = {}  # Will store 'service' -> 'DefaultService' mappings
+            potential_class_names = set()
+            potential_class_names.update(var[0] for var in imported_variables)
+            potential_class_names.update(func[0] for func in imported_functions)
             
-            # Create pattern using imported variable names
-            imported_class_names = '|'.join([var[0] for var in imported_variables])
+            imported_class_names = '|'.join(potential_class_names)
             if imported_class_names:
                 instance_pattern = rf'const\s+(\w+)\s*=\s*new\s+({imported_class_names})'
                 
@@ -592,19 +601,22 @@ class FileNodeCreator:
         
         return node_data
 
-    def save_to_neo4j(self, node_data: Dict[str, Any], file_path: str):
+    def save_to_neo4j(self, node_data: Dict[str, Any], file_path: str, remove: str):
         """Save the file node to Neo4j.
         
         Args:
             node_data (Dict): Node metadata
             file_path (str): Path to the file
+            remove (str): Path prefix to remove
         """
         with self.driver.session() as session:
-            # Convert all nested structures to JSON strings
-            node_data['methods_of_classes'] = json.dumps(node_data['methods_of_classes'])
-            node_data['function_calls'] = json.dumps(node_data['function_calls'])
+            # Remove prefix from file_path
+            file_path = file_path.replace(remove, '')
+            
             node_data['imported_variables'] = json.dumps(node_data['imported_variables'])
             node_data['imported_functions'] = json.dumps(node_data['imported_functions'])
+            node_data['methods_of_classes'] = json.dumps(node_data['methods_of_classes'])
+            node_data['function_calls'] = json.dumps(node_data['function_calls'])
             node_data['function_definitions'] = json.dumps(node_data['function_definitions'])
             node_data['class_definitions'] = json.dumps(node_data['class_definitions'])
             
@@ -631,9 +643,10 @@ class FileNodeCreator:
                 barrel_directories: $barrel_directories
             })
             """
+            # print(file_path, "file_path")
             session.run(cypher_query, file_path=file_path, **node_data)
 
-    def process_codebase(self, root_dir: str):
+    def process_codebase(self, root_dir: str,remove: str):
         """Process entire codebase and create nodes for all files.
         
         Args:
@@ -645,11 +658,7 @@ class FileNodeCreator:
                     file_path = os.path.join(root, file)
                     print(f"Processing file: {file_path}")
                     node_data = self.create_file_node(file_path)
-                    self.save_to_neo4j(node_data, file_path)
-                elif self.language == 'python' and file.endswith('.py'):
-                    file_path = os.path.join(root, file)
-                    node_data = self.create_file_node(file_path)
-                    self.save_to_neo4j(node_data, file_path)
+                    self.save_to_neo4j(node_data, file_path, remove)
 
     def close(self):
         """Close the Neo4j connection."""
@@ -675,10 +684,16 @@ class FileNodeCreator:
 
 if __name__ == "__main__":
     # Initialize FileNodeCreator
-    creator = FileNodeCreator(language='javascript')
+    remove = '/app/test/'
+    creator = FileNodeCreator(language='javascript',remove=remove)
     
     # Specify the test file
-    test_file = "./test/js-test-project/create.js"
+    test_file = "/app/test/server/product/engines/data-sync/custodian-data/transaction-processing/pre-processor-utils.js"
     print(f"\nProcessing file: {test_file}")
     
-    creator.create_file_node(test_file)
+    node_data = creator.create_file_node(test_file)
+    del node_data['code']
+    print(node_data, "node_data")
+    input("Press Enter to continue...")
+    creator.save_to_neo4j(node_data, test_file, remove)
+
